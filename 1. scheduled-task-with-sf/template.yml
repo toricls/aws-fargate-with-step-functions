@@ -1,0 +1,340 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Creates scheduled Fargate task (once-per-15-min) with Step Functions and EventBridge'
+
+Parameters:
+  PublicSubnets:
+    Type: 'List<AWS::EC2::Subnet::Id>'
+    Description: "This CloudFormation template requires 'public' subnets to run Fargate task. See the comment for the 'AssignPublicIp' field in the 'StateMachine' resource."
+  SecurityGroups:
+    Type: 'List<AWS::EC2::SecurityGroup::Id>'
+
+Resources:
+  Cluster:
+    Type: 'AWS::ECS::Cluster'
+    Properties:
+      ClusterSettings:
+        - Name: containerInsights
+          Value: enabled
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      RequiresCompatibilities:
+        - "FARGATE"
+      ExecutionRoleArn: !Ref TaskExecutionRole
+      Cpu: 256
+      Memory: 512
+      NetworkMode: awsvpc
+      ContainerDefinitions:
+        - Image: 'busybox:latest'
+          Name: 'fargate-example-app'
+          PortMappings:
+          - ContainerPort: 80
+            HostPort: 80
+            Protocol: tcp
+          Essential: true
+          EntryPoint:
+          - 'sh'
+          - '-c'
+          Command:
+          - 'echo "Hello from ${PARAM}!"'
+          LogConfiguration:
+            LogDriver: 'awslogs'
+            Options:
+              awslogs-group: !Ref LogGroup
+              awslogs-region: !Ref 'AWS::Region'
+              awslogs-stream-prefix: 'scheduled-task-with-sf'
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+
+  Rule:
+    Type: 'AWS::Events::Rule'
+    Properties:
+      ScheduleExpression: 'rate(15 minutes)'
+      State: ENABLED
+      Targets:
+      - Arn: !Ref StateMachine
+        Id: statemachine
+        RoleArn: !GetAtt 'RuleRole.Arn'
+
+  RuleRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: 'events.amazonaws.com'
+          Action: 'sts:AssumeRole'
+      Policies:
+      - PolicyName: EventRulePolicy
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action: 'states:StartExecution'
+            Resource: !Ref StateMachine
+
+  StateMachine:
+    Type: 'AWS::StepFunctions::StateMachine'
+    Properties:
+      RoleArn: !GetAtt 'StateMachineRole.Arn'
+      LoggingConfiguration:
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineExecutionLogGroup.Arn
+        IncludeExecutionData: 'true'
+        Level: 'FATAL'
+      DefinitionSubstitutions:
+        Cluster: !GetAtt Cluster.Arn
+        TaskDefinition: !Ref TaskDefinition
+        Subnets: !Join
+          - '","'
+          - !Ref PublicSubnets
+        AssignPublicIp: 'ENABLED' # Should be DISABLED if you use private subnets + NAT
+        SecurityGroups: !Join
+          - '","'
+          - !Ref SecurityGroups
+        Timeout: 900 # seconds
+        SNSTopicArn: !Ref SNSTopic
+      # Note:
+      # - Consider 'CapacityProviderStrategy' instead of 'LaunchType'
+      # - Use specific 'PlatformVersion' and not LATEST
+      # - Enable long arn format to use tag propagation
+      DefinitionString: |-
+        {
+          "Version": "1.0",
+          "Comment": "Run AWS Fargate task",
+          "TimeoutSeconds": ${Timeout},
+          "StartAt": "Run Fargate Task",
+          "States": {
+            "Run Fargate Task": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::ecs:runTask.sync",
+              "Parameters": {
+                "LaunchType": "FARGATE",
+                "Cluster": "${Cluster}",
+                "TaskDefinition": "${TaskDefinition}",
+                "Group.$": "$$.Execution.Name",
+                "NetworkConfiguration": {
+                  "AwsvpcConfiguration": {
+                    "Subnets": ["${Subnets}"],
+                    "AssignPublicIp": "${AssignPublicIp}",
+                    "SecurityGroups": ["${SecurityGroups}"]
+                  }
+                },
+                "Overrides": {
+                  "ContainerOverrides": [
+                    {
+                      "Name": "fargate-example-app",
+                      "Environment": [
+                        {
+                          "Name": "PARAM",
+                          "Value": "AWS Step Functions"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              },
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "IntervalSeconds": 3,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 1.0
+                },
+                {
+                  "ErrorEquals": [
+                    "ECS.AmazonECSException"
+                  ],
+                  "IntervalSeconds": 10,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Next": "Notify Success",
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.ALL"
+                  ],
+                  "Next": "Notify Failure"
+                }
+              ]
+            },
+            "Notify Success": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "Message": "AWS Fargate + Step Functions: Scheduled task succeeded",
+                "MessageAttributes": {
+                  "ExitCode": {
+                    "DataType": "String",
+                    "StringValue.$": "$.Containers[?(@.Name=='fargate-app')].ExitCode"
+                  },
+                  "FullTaskResult": {
+                    "DataType": "String",
+                    "StringValue.$": "$"
+                  }
+                },
+                "TopicArn": "${SNSTopicArn}"
+              },
+              "End": true
+            },
+            "Notify Failure": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::sns:publish",
+              "Parameters": {
+                "Message": "AWS Fargate + Step Functions: Scheduled task failed",
+                "MessageAttributes": {
+                  "ExitCode": {
+                    "DataType": "String",
+                    "StringValue.$": "$.Containers[?(@.Name=='fargate-app')].ExitCode"
+                  },
+                  "FullTaskResult": {
+                    "DataType": "String",
+                    "StringValue.$": "$"
+                  }
+                },
+                "TopicArn": "${SNSTopicArn}"
+              },
+              "End": true
+            }
+          }
+        }
+
+  StateMachineExecutionLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties: 
+      RetentionInDays: 7
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: ecs-tasks.amazonaws.com
+          Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+      - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+      # If the task uses Secrets Manager integration
+      #Policies:
+      #- PolicyDocument:
+      #    Statement:
+      #    - Effect: Allow
+      #      Action: 'secretsmanager:GetSecretValue'
+      #      Resource:
+      #      - arn:aws:secretsmanager:<region>:<aws_account_id>:secret:secret_name
+      #      - arn:aws:kms:<region>:<aws_account_id>:key/key_id
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: ecs-tasks.amazonaws.com
+          Action: 'sts:AssumeRole'
+      #Policies:
+      #-
+
+  StateMachineRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: 'states.amazonaws.com'
+          Action: 'sts:AssumeRole'
+      Policies:
+      - PolicyName: StateMachine
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action: 'iam:PassRole'
+            Resource:
+            - !GetAtt TaskExecutionRole.Arn
+            - !GetAtt TaskRole.Arn
+          - Effect: Allow
+            Action: 'ecs:RunTask'
+            Resource: !Ref TaskDefinition
+            Condition:
+              ArnEquals:
+                'ecs:cluster': !GetAtt Cluster.Arn
+          - Effect: Allow
+            Action:
+            - 'ecs:StopTask'
+            - 'ecs:DescribeTasks'
+            Resource: '*'
+            Condition:
+              ArnEquals:
+                'ecs:cluster': !GetAtt Cluster.Arn
+          - Effect: Allow
+            Action:
+              - 'sns:Publish'
+            Resource: !Ref SNSTopic
+          - Effect: Allow
+            Action:
+              - 'logs:CreateLogDelivery'
+              - 'logs:GetLogDelivery'
+              - 'logs:UpdateLogDelivery'
+              - 'logs:DeleteLogDelivery'
+              - 'logs:ListLogDeliveries'
+              - 'logs:PutResourcePolicy'
+              - 'logs:DescribeResourcePolicies'
+              - 'logs:DescribeLogGroups'
+            Resource: '*' # CWL doesn't support resource-level permissions
+          - Effect: Allow
+            Action:
+            - 'events:PutTargets'
+            - 'events:PutRule'
+            - 'events:DescribeRule'
+            Resource: !Sub 'arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForECSTaskRule'
+
+  ExecutionsFailedAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmDescription: 'Step Functions state machine execution failed.'
+      Namespace: 'AWS/States'
+      MetricName: ExecutionsFailed
+      Dimensions:
+      - Name: StateMachineArn
+        Value: !Ref StateMachine
+      Statistic: Sum
+      Period: 300
+      DatapointsToAlarm: 1
+      EvaluationPeriods: 1
+      Threshold: 0
+      TreatMissingData: notBreaching
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+      - !Ref SNSTopic
+  ExecutionsTimeoutAlarm:
+    Type: 'AWS::CloudWatch::Alarm'
+    Properties:
+      AlarmDescription: 'Step Functions state machine execution timed out.'
+      Namespace: 'AWS/States'
+      MetricName: ExecutionsTimedOut
+      Dimensions:
+      - Name: StateMachineArn
+        Value: !Ref StateMachine
+      Statistic: Sum
+      Period: 300
+      DatapointsToAlarm: 1
+      EvaluationPeriods: 1
+      Threshold: 0
+      TreatMissingData: notBreaching
+      ComparisonOperator: GreaterThanThreshold
+      AlarmActions:
+      - !Ref SNSTopic
