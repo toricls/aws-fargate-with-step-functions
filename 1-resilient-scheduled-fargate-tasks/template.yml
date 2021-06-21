@@ -1,5 +1,5 @@
 AWSTemplateFormatVersion: '2010-09-09'
-Description: 'Creates scheduled Fargate task (once-per-15-min) with Step Functions and EventBridge'
+Description: 'Creates scheduled Fargate task (once-per-15-min) with Step Functions and EventBridge. See the latest version at https://github.com/toricls/aws-fargate-with-step-functions.'
 
 Parameters:
   PublicSubnets:
