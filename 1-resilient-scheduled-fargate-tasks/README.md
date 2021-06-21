@@ -38,6 +38,12 @@ Here is the except of the state machine JSON defined in the CloudFormation templ
 }
 ```
 
+## FAQ
+
+Q: While `States.TaskFailed` catches almost all errors including application failures not only task-level failures, I'd like to have more granular controls over failures. How can I achieve it?
+
+A: See [this "stoppedReason based error handling" example](../3-stoppedreason-based-error-handling) to implement more granular controls for various Fargate task errors.
+
 ## Set up
 
 Use the [CloudFormation template](./template.yml) to provision resources.

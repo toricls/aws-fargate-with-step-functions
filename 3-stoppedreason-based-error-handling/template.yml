@@ -1,0 +1,220 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Creates Step Functions state machine with granular error handling for Fargate task invocations. See the latest version at https://github.com/toricls/aws-fargate-with-step-functions.'
+
+Parameters:
+  PublicSubnets:
+    Type: 'List<AWS::EC2::Subnet::Id>'
+    Description: "This CloudFormation template requires 'public' subnets to run Fargate task. See the comment for the 'AssignPublicIp' field in the 'StateMachine' resource."
+  SecurityGroups:
+    Type: 'List<AWS::EC2::SecurityGroup::Id>'
+
+Resources:
+  Cluster:
+    Type: 'AWS::ECS::Cluster'
+
+  LogGroup:
+    Type: AWS::Logs::LogGroup
+
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      RequiresCompatibilities:
+        - "FARGATE"
+      ExecutionRoleArn: !Ref TaskExecutionRole
+      Cpu: 256
+      Memory: 512
+      NetworkMode: awsvpc
+      ContainerDefinitions:
+        - Image: 'an-image-which-does-not-exist:even-not-latest'
+          Name: 'fargate-example-app'
+          PortMappings:
+          - ContainerPort: 80
+            HostPort: 80
+            Protocol: tcp
+          Essential: true
+
+  StateMachine:
+    Type: 'AWS::StepFunctions::StateMachine'
+    Properties:
+      RoleArn: !GetAtt 'StateMachineRole.Arn'
+      LoggingConfiguration:
+        Destinations:
+          - CloudWatchLogsLogGroup:
+              LogGroupArn: !GetAtt StateMachineExecutionLogGroup.Arn
+        IncludeExecutionData: 'true'
+        Level: 'FATAL'
+      DefinitionSubstitutions:
+        Cluster: !GetAtt Cluster.Arn
+        TaskDefinition: !Ref TaskDefinition
+        Subnets: !Join
+          - '","'
+          - !Ref PublicSubnets
+        AssignPublicIp: 'ENABLED' # Should be DISABLED if you use private subnets + NAT
+        SecurityGroups: !Join
+          - '","'
+          - !Ref SecurityGroups
+        Timeout: 120 # seconds
+      # Note:
+      # - Consider 'CapacityProviderStrategy' instead of 'LaunchType'
+      # - Use specific 'PlatformVersion' and not LATEST
+      # - Enable long arn format to use tag propagation
+      DefinitionString: |-
+        {
+          "Version": "1.0",
+          "Comment": "Run AWS Fargate task",
+          "TimeoutSeconds": ${Timeout},
+          "StartAt": "Run Fargate Task",
+          "States": {
+            "Run Fargate Task": {
+              "Type": "Task",
+              "Resource": "arn:aws:states:::ecs:runTask.sync",
+              "Parameters": {
+                "LaunchType": "FARGATE",
+                "Cluster": "${Cluster}",
+                "TaskDefinition": "${TaskDefinition}",
+                "Group.$": "$$.Execution.Name",
+                "NetworkConfiguration": {
+                  "AwsvpcConfiguration": {
+                    "Subnets": ["${Subnets}"],
+                    "AssignPublicIp": "${AssignPublicIp}",
+                    "SecurityGroups": ["${SecurityGroups}"]
+                  }
+                }
+              },
+              "End": true,
+              "Retry": [
+                {
+                  "ErrorEquals": [
+                    "ECS.AmazonECSException"
+                  ],
+                  "IntervalSeconds": 10,
+                  "MaxAttempts": 3,
+                  "BackoffRate": 2.0
+                }
+              ],
+              "Catch": [
+                {
+                  "ErrorEquals": [
+                    "States.TaskFailed"
+                  ],
+                  "Next": "Cause to Json"
+                }
+              ]
+            },
+            "Cause to Json": {
+              "Type": "Pass",
+              "Parameters": {
+                "Cause.$": "States.StringToJson($.Cause)"
+              },
+              "Next": "Retry or Finish"
+            },
+            "Retry or Finish": {
+              "Type": "Choice",
+              "Choices": [
+                {
+                  "Variable": "$.Cause.StoppedReason",
+                  "StringMatches": "CannotPullContainerError: *",
+                  "Next": "Fail"
+                },
+                {
+                  "Variable": "$.Cause.StoppedReason",
+                  "StringMatches": "ResourceInitializationError: *",
+                  "Next": "Run Fargate Task"
+                }
+              ],
+              "Default": "Fail"
+            },
+            "Fail": {
+              "Type": "Fail"
+            }
+          }
+        }
+
+  StateMachineExecutionLogGroup:
+    Type: 'AWS::Logs::LogGroup'
+    Properties: 
+      RetentionInDays: 7
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: ecs-tasks.amazonaws.com
+          Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+      - 'arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy'
+      # If the task uses Secrets Manager integration
+      #Policies:
+      #- PolicyDocument:
+      #    Statement:
+      #    - Effect: Allow
+      #      Action: 'secretsmanager:GetSecretValue'
+      #      Resource:
+      #      - arn:aws:secretsmanager:<region>:<aws_account_id>:secret:secret_name
+      #      - arn:aws:kms:<region>:<aws_account_id>:key/key_id
+
+  TaskRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: ecs-tasks.amazonaws.com
+          Action: 'sts:AssumeRole'
+      #Policies:
+      #-
+
+  StateMachineRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: 'states.amazonaws.com'
+          Action: 'sts:AssumeRole'
+      Policies:
+      - PolicyName: StateMachine
+        PolicyDocument:
+          Statement:
+          - Effect: Allow
+            Action: 'iam:PassRole'
+            Resource:
+            - !GetAtt TaskExecutionRole.Arn
+            - !GetAtt TaskRole.Arn
+          - Effect: Allow
+            Action: 'ecs:RunTask'
+            Resource: !Ref TaskDefinition
+            Condition:
+              ArnEquals:
+                'ecs:cluster': !GetAtt Cluster.Arn
+          - Effect: Allow
+            Action:
+            - 'ecs:StopTask'
+            - 'ecs:DescribeTasks'
+            Resource: '*'
+            Condition:
+              ArnEquals:
+                'ecs:cluster': !GetAtt Cluster.Arn
+          - Effect: Allow
+            Action:
+              - 'logs:CreateLogDelivery'
+              - 'logs:GetLogDelivery'
+              - 'logs:UpdateLogDelivery'
+              - 'logs:DeleteLogDelivery'
+              - 'logs:ListLogDeliveries'
+              - 'logs:PutResourcePolicy'
+              - 'logs:DescribeResourcePolicies'
+              - 'logs:DescribeLogGroups'
+            Resource: '*' # CWL doesn't support resource-level permissions
+          - Effect: Allow
+            Action:
+            - 'events:PutTargets'
+            - 'events:PutRule'
+            - 'events:DescribeRule'
+            Resource: !Sub 'arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/StepFunctionsGetEventsForECSTaskRule'
