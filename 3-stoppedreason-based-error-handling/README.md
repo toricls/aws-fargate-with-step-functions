@@ -12,7 +12,7 @@ For example, you can do "Retry when the error is `ResourceInitializationError`, 
 
 ## FAQ
 
-Q: What are the Pros/Cons comparing to using the Step Functions' "Retry" field (which is used in [this example](../1-resilient-scheduled-fargate-tasks))?
+Q: What are the Pros/Cons comparing to using the "Retry" field (which is used in [another example](../1-resilient-scheduled-fargate-tasks))?
 
 ### Pros
 
