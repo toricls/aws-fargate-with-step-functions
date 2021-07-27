@@ -10,7 +10,7 @@ There are [_normal_ scheduled tasks](https://docs.aws.amazon.com/AmazonECS/lates
 
 In this example, we also use EventBridge cron rules but do not invoke Fargate tasks directly from within EventBridge. Instead, it starts Step Functions state machine to invoke Fargate tasks to use the "Retry" feature in Step Functions to handle application errors and failures in Fargate task, or errors happened in Amazon ECS.
 
-Here is the except of the state machine JSON defined in the CloudFormation template. The `ECS.AmazonECSException` error is caused by Amazon ECS in the case of API throttling for calling ECS RunTask API for example. The `States.TaskFailed` error is more generic one defined by Step Functions and it catches everything other than `States.Timeout` error. See the [Step Functions documentation](https://docs.aws.amazon.com/step-functions/latest/dg/concepts-error-handling.html) for further details.
+Here is the excerpt of the state machine JSON defined in the CloudFormation template. The `ECS.AmazonECSException` error is caused by Amazon ECS in the case of API throttling for calling ECS RunTask API for example. The `States.TaskFailed` error is more generic one defined by Step Functions and it catches everything other than `States.Timeout` error. See the [Step Functions documentation](https://docs.aws.amazon.com/step-functions/latest/dg/concepts-error-handling.html) for further details.
 
 ```json
 ...
