@@ -1,4 +1,4 @@
-# Parallelized Fargate tasks with Step Functions "Map"
+# Granular Error Handling based on Fargate Task's "stoppedReason"s
 
 ## Overview by Step Functions Workflow Studio
 
